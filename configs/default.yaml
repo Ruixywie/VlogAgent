@@ -1,0 +1,65 @@
+# VlogAgent 默认配置
+
+# OpenAI API 配置
+openai:
+  api_key: ""           # 在此填入 OpenAI API Key，或设置环境变量 OPENAI_API_KEY
+  model: "gpt-4o"
+  base_url: null        # 可选：自定义 API 端点
+
+# Perceiver 配置
+perceiver:
+  # 场景分割
+  scene_threshold: 27.0          # ContentDetector 阈值
+  min_scene_len: 15              # 最小场景帧数
+
+  # 关键帧
+  keyframes_per_segment: 3       # 每段提取关键帧数
+
+  # 候选指令数
+  max_candidates: 15
+  min_candidates: 8
+
+  # Whisper ASR
+  whisper_model: "base"          # tiny / base / small / medium / large
+
+# Planner (MCTS) 配置
+planner:
+  mcts_depth: 3                  # 搜索深度
+  mcts_simulations: 30           # 模拟次数
+  ucb_c: 1.4                     # UCB 探索系数
+  top_k: 3                       # 返回 Top-K 方案
+
+# Executor 配置
+executor:
+  ffmpeg_path: "ffmpeg"          # FFmpeg 可执行文件路径
+  ffprobe_path: "ffprobe"
+  temp_dir: "output/temp"
+  # 工具参数范围
+  brightness_range: [-0.3, 0.3]
+  contrast_range: [0.5, 2.0]
+  saturation_range: [0.5, 2.0]
+  denoise_strength_range: [1, 10]
+  sharpen_range: [0.5, 3.0]
+  stabilize_smoothing: [5, 30]
+
+# Evaluator 配置
+evaluator:
+  # 各维度权重
+  weights:
+    visual_quality: 0.25
+    content_fidelity: 0.25
+    inter_segment_consistency: 0.20
+    audio_integrity: 0.10
+    aesthetic: 0.20
+
+  # CLIP 模型
+  clip_model: "ViT-B-32"
+  clip_pretrained: "openai"
+
+  # 闭环控制
+  min_improvement: 0.01          # 最小提升阈值
+  max_no_improve_rounds: 2       # 连续无提升轮数上限
+
+# Agent 主循环
+agent:
+  max_iterations: 3              # 最大闭环迭代次数

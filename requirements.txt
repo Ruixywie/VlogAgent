@@ -1,0 +1,9 @@
+opencv-python
+scenedetect[opencv]
+openai-whisper
+open-clip-torch
+librosa
+Pillow
+numpy
+pyyaml
+openai
