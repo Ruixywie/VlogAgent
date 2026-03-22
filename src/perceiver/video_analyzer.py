@@ -17,7 +17,8 @@ class VideoAnalyzer:
     def __init__(self, config: dict):
         self.scene_threshold = config.get("scene_threshold", 27.0)
         self.min_scene_len = config.get("min_scene_len", 15)
-        self.keyframes_per_segment = config.get("keyframes_per_segment", 3)
+        self.keyframe_interval = config.get("keyframe_interval", 1.0)  # 每N秒提取1帧
+        self.max_keyframes_per_segment = config.get("max_keyframes_per_segment", 10)
         self.whisper_model_name = config.get("whisper_model", "base")
         self.ffmpeg_path = config.get("ffmpeg_path", "ffmpeg")
         self._whisper_model = None
@@ -123,12 +124,15 @@ class VideoAnalyzer:
     def extract_keyframes(
         self, video_path: str, start: float, end: float, seg_id: int, output_dir: str
     ) -> list[str]:
-        """从片段中均匀提取关键帧"""
+        """按时间间隔自适应提取关键帧（默认每秒1帧，上限可配置）"""
         os.makedirs(output_dir, exist_ok=True)
         duration = end - start
-        n = self.keyframes_per_segment
-        paths = []
 
+        # 根据片段时长和间隔计算帧数，至少2帧
+        n = max(2, int(duration / self.keyframe_interval))
+        n = min(n, self.max_keyframes_per_segment)
+
+        paths = []
         for i in range(n):
             t = start + duration * (i + 0.5) / n
             out_path = os.path.join(output_dir, f"seg{seg_id}_kf{i}.jpg")

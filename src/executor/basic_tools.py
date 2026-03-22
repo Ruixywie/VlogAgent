@@ -1,4 +1,11 @@
-"""基础工具：FFmpeg / OpenCV 封装"""
+"""基础工具：FFmpeg / OpenCV 封装
+
+设计原则：
+- 搜索阶段直接在原视频上执行，结果仅用于评估
+- 最终执行时滤镜合并为一次编码，使用视觉无损参数
+- 搜索阶段用 SEARCH_ENCODE_ARGS（速度优先，结果会丢弃）
+- 最终输出用 ENCODE_ARGS（质量优先，CRF=10 视觉无损）
+"""
 
 import os
 import subprocess
@@ -7,6 +14,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# 搜索阶段编码参数（结果仅用于评估，速度优先）
+SEARCH_ENCODE_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"]
+
+# 最终输出编码参数（质量优先，CRF=10 视觉无损）
+ENCODE_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "10", "-c:a", "aac", "-b:a", "320k"]
+
 
 class BasicTools:
     def __init__(self, config: dict):
@@ -14,6 +27,9 @@ class BasicTools:
         self.ffprobe = config.get("ffprobe_path", "ffprobe")
         self.temp_dir = config.get("temp_dir", "output/temp")
         os.makedirs(self.temp_dir, exist_ok=True)
+        # 滤镜收集器：用于合并多个滤镜为一次 FFmpeg 调用
+        self._pending_vfilters: list[str] = []
+        self._pending_afilters: list[str] = []
 
     def _run_ffmpeg(self, args: list[str], output_path: str) -> str:
         """执行 FFmpeg 命令"""
@@ -21,16 +37,47 @@ class BasicTools:
         logger.info(f"FFmpeg: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg 失败: {result.stderr}")
+            raise RuntimeError(f"FFmpeg 失败: {result.stderr[-500:]}")
         return output_path
 
     def _make_output_path(self, input_path: str, suffix: str) -> str:
-        """生成输出文件路径"""
         stem = Path(input_path).stem
         ext = Path(input_path).suffix
         return os.path.join(self.temp_dir, f"{stem}_{suffix}{ext}")
 
-    # ── 色彩调整 ──────────────────────────────────────
+    # ══════════════════════════════════════════════════════
+    # 滤镜链合并模式
+    # ══════════════════════════════════════════════════════
+
+    def collect_filter(self, vfilter: str):
+        """收集一个视频滤镜，稍后统一应用"""
+        self._pending_vfilters.append(vfilter)
+
+    def apply_collected_filters(self, video_path: str, suffix: str = "edited") -> str:
+        """一次性应用所有收集的滤镜（单次编码）"""
+        if not self._pending_vfilters:
+            return video_path
+
+        output = self._make_output_path(video_path, suffix)
+        vf = ",".join(self._pending_vfilters)
+        args = ["-i", video_path, "-vf", vf] + ENCODE_ARGS
+
+        if self._pending_afilters:
+            af = ",".join(self._pending_afilters)
+            args = ["-i", video_path, "-vf", vf, "-af", af] + [
+                "-c:v", "libx264", "-preset", "slow", "-crf", "16"
+            ]
+
+        self._pending_vfilters.clear()
+        self._pending_afilters.clear()
+        return self._run_ffmpeg(args, output)
+
+    def has_pending_filters(self) -> bool:
+        return len(self._pending_vfilters) > 0
+
+    # ══════════════════════════════════════════════════════
+    # 单工具调用（搜索阶段在代理副本上用，速度优先）
+    # ══════════════════════════════════════════════════════
 
     def color_adjust(
         self,
@@ -40,56 +87,38 @@ class BasicTools:
         saturation: float = 1.0,
         gamma: float = 1.0,
     ) -> str:
-        """调整亮度/对比度/饱和度/Gamma"""
         output = self._make_output_path(video_path, "color")
         vf = f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma}"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
-    # ── 白平衡 ────────────────────────────────────────
-
     def white_balance(self, video_path: str, temperature: float = 6500) -> str:
-        """调整色温（白平衡）"""
         output = self._make_output_path(video_path, "wb")
         vf = f"colortemperature=temperature={temperature}"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
-    # ── 降噪 ──────────────────────────────────────────
-
     def denoise(self, video_path: str, strength: float = 4.0) -> str:
-        """视频降噪（hqdn3d）"""
         output = self._make_output_path(video_path, "denoise")
         vf = f"hqdn3d=luma_spatial={strength}"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
-
-    # ── 锐化 ──────────────────────────────────────────
 
     def sharpen(self, video_path: str, amount: float = 1.0) -> str:
-        """锐化（unsharp mask）"""
         output = self._make_output_path(video_path, "sharp")
-        # unsharp=lx:ly:la:cx:cy:ca  (luma_size:luma_size:luma_amount:...)
         vf = f"unsharp=5:5:{amount}:5:5:0"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
-    # ── 稳定 ──────────────────────────────────────────
-
     def stabilize(self, video_path: str, smoothing: int = 10) -> str:
-        """视频防抖（vidstab 两遍处理）"""
+        """视频防抖（vidstab 两遍处理）— 此工具无法合并，必须独立执行"""
         output = self._make_output_path(video_path, "stab")
         transforms_path = os.path.join(self.temp_dir, "transforms.trf")
 
-        # Pass 1: 检测运动
         cmd1 = [
             self.ffmpeg, "-y",
             "-i", video_path,
@@ -98,37 +127,27 @@ class BasicTools:
         ]
         r1 = subprocess.run(cmd1, capture_output=True, text=True)
         if r1.returncode != 0:
-            raise RuntimeError(f"vidstabdetect 失败: {r1.stderr}")
+            raise RuntimeError(f"vidstabdetect 失败: {r1.stderr[-500:]}")
 
-        # Pass 2: 应用稳定
         vf = f"vidstabtransform=input={transforms_path}:smoothing={smoothing}:interpol=linear,unsharp=5:5:0.8:3:3:0.4"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
-    # ── LUT 应用 ──────────────────────────────────────
-
     def apply_lut(self, video_path: str, lut_file: str) -> str:
-        """应用 3D LUT"""
         output = self._make_output_path(video_path, "lut")
         vf = f"lut3d=file={lut_file}"
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-c:a", "copy"],
-            output,
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
-    # ── 变速 ──────────────────────────────────────────
-
     def speed_adjust(self, video_path: str, factor: float = 1.0) -> str:
-        """视频变速（音视频同步）"""
         if factor <= 0:
             raise ValueError("speed factor 必须 > 0")
         output = self._make_output_path(video_path, "speed")
         pts = 1.0 / factor
         vf = f"setpts={pts}*PTS"
 
-        # 音频变速：atempo 只支持 [0.5, 2.0]，需要链式调用
         atempo_filters = []
         remaining = factor
         while remaining > 2.0:
@@ -141,79 +160,101 @@ class BasicTools:
         af = ",".join(atempo_filters)
 
         return self._run_ffmpeg(
-            ["-i", video_path, "-vf", vf, "-af", af],
+            ["-i", video_path, "-vf", vf, "-af", af,
+             "-c:v", "libx264", "-preset", "fast", "-crf", "20"],
             output,
         )
 
     # ── 片段裁剪 ──────────────────────────────────────
 
-    def trim_segment(
-        self, video_path: str, start: float, end: float
-    ) -> str:
-        """裁剪视频片段"""
+    def trim_segment(self, video_path: str, start: float, end: float) -> str:
         output = self._make_output_path(video_path, f"trim_{start:.1f}_{end:.1f}")
         return self._run_ffmpeg(
-            [
-                "-i", video_path,
-                "-ss", f"{start:.3f}",
-                "-to", f"{end:.3f}",
-                "-c:v", "libx264", "-c:a", "aac",
-            ],
+            ["-i", video_path,
+             "-ss", f"{start:.3f}", "-to", f"{end:.3f}"]
+            + SEARCH_ENCODE_ARGS,
             output,
         )
 
     # ── 片段拼接 ──────────────────────────────────────
 
     def concat_segments(self, segment_paths: list[str], output_path: str) -> str:
-        """拼接多个视频片段"""
+        """拼接多个视频片段（重新编码以确保无缝）"""
         list_file = os.path.join(self.temp_dir, "concat_list.txt")
         with open(list_file, "w") as f:
             for p in segment_paths:
                 f.write(f"file '{os.path.abspath(p)}'\n")
 
+        # 用重新编码拼接，避免 -c copy 导致的拼接点跳变
         return self._run_ffmpeg(
-            ["-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy"],
+            ["-f", "concat", "-safe", "0", "-i", list_file] + SEARCH_ENCODE_ARGS,
             output_path,
         )
+
+    # ── 获取滤镜字符串（供合并模式使用）────────────────
+
+    @staticmethod
+    def get_filter_string(tool_name: str, params: dict) -> str | None:
+        """返回工具对应的 FFmpeg 滤镜字符串，用于合并。不可合并的工具返回 None"""
+        mapping = {
+            "color_adjust": lambda p: (
+                f"eq=brightness={p.get('brightness', 0)}:"
+                f"contrast={p.get('contrast', 1)}:"
+                f"saturation={p.get('saturation', 1)}:"
+                f"gamma={p.get('gamma', 1)}"
+            ),
+            "white_balance": lambda p: f"colortemperature=temperature={p.get('temperature', 6500)}",
+            "denoise": lambda p: f"hqdn3d=luma_spatial={p.get('strength', 4)}",
+            "sharpen": lambda p: f"unsharp=5:5:{p.get('amount', 1)}:5:5:0",
+        }
+        if tool_name in mapping:
+            return mapping[tool_name](params)
+        return None  # stabilize, speed_adjust, apply_lut 等不可合并
 
     # ── 工具注册表 ────────────────────────────────────
 
     def get_tool_registry(self) -> dict:
-        """返回所有可用工具的名称和说明"""
         return {
             "color_adjust": {
                 "func": self.color_adjust,
                 "description": "调整亮度/对比度/饱和度/Gamma",
                 "params": ["brightness", "contrast", "saturation", "gamma"],
+                "mergeable": True,
             },
             "white_balance": {
                 "func": self.white_balance,
                 "description": "调整色温（白平衡）",
                 "params": ["temperature"],
+                "mergeable": True,
             },
             "denoise": {
                 "func": self.denoise,
                 "description": "视频降噪",
                 "params": ["strength"],
+                "mergeable": True,
             },
             "sharpen": {
                 "func": self.sharpen,
                 "description": "锐化画面",
                 "params": ["amount"],
+                "mergeable": True,
             },
             "stabilize": {
                 "func": self.stabilize,
                 "description": "视频防抖",
                 "params": ["smoothing"],
+                "mergeable": False,
             },
             "apply_lut": {
                 "func": self.apply_lut,
                 "description": "应用 3D LUT 滤镜",
                 "params": ["lut_file"],
+                "mergeable": False,
             },
             "speed_adjust": {
                 "func": self.speed_adjust,
                 "description": "视频变速",
                 "params": ["factor"],
+                "mergeable": False,
             },
         }

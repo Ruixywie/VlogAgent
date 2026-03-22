@@ -8,12 +8,16 @@ from src.agent import VlogAgent
 
 
 def setup_logging(verbose: bool = False):
+    # 默认只显示 src.* 的 INFO 级别，-v 时显示 DEBUG
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    # 压掉第三方库的噪音日志
+    for noisy in ["httpx", "httpcore", "openai", "urllib3", "numba", "torch"]:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main():
@@ -32,7 +36,7 @@ def main():
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="详细日志输出",
+        help="详细日志输出（含第三方库 DEBUG）",
     )
     args = parser.parse_args()
 

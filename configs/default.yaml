@@ -1,10 +1,12 @@
 # VlogAgent 默认配置
 
-# OpenAI API 配置
+# LLM API 配置（阿里云百炼，按优先级自动降级）
 openai:
-  api_key: ""           # 在此填入 OpenAI API Key，或设置环境变量 OPENAI_API_KEY
-  model: "gpt-4o"
-  base_url: null        # 可选：自定义 API 端点
+  api_key: "sk-85491afc6fd747568bd593357f15c5eb"           # 填入阿里云百炼 API Key，或设置环境变量 OPENAI_API_KEY
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # 模型优先级列表：第一个配额用尽后自动切换到下一个
+  models:
+    - "qwen3-vl-plus-2025-09-23"
 
 # Perceiver 配置
 perceiver:
@@ -12,8 +14,9 @@ perceiver:
   scene_threshold: 27.0          # ContentDetector 阈值
   min_scene_len: 15              # 最小场景帧数
 
-  # 关键帧
-  keyframes_per_segment: 3       # 每段提取关键帧数
+  # 关键帧抽帧（密集帧序列给 VLM 观察）
+  keyframe_interval: 2.0         # 每N秒提取1帧（1.0=每秒1帧）
+  max_keyframes_per_segment: 10  # 单段最大帧数（控制 token 消耗）
 
   # 候选指令数
   max_candidates: 15
@@ -25,7 +28,7 @@ perceiver:
 # Planner (MCTS) 配置
 planner:
   mcts_depth: 3                  # 搜索深度
-  mcts_simulations: 30           # 模拟次数
+  mcts_simulations: 50           # 模拟次数（本地评估，无 API 成本）
   ucb_c: 1.4                     # UCB 探索系数
   top_k: 3                       # 返回 Top-K 方案
 
@@ -44,13 +47,13 @@ executor:
 
 # Evaluator 配置
 evaluator:
-  # 各维度权重
+  # 各维度权重（参考 PhotoAgent：美学为主，技术指标为辅）
   weights:
-    visual_quality: 0.25
-    content_fidelity: 0.25
-    inter_segment_consistency: 0.20
-    audio_integrity: 0.10
-    aesthetic: 0.20
+    visual_quality: 0.10
+    content_fidelity: 0.15
+    inter_segment_consistency: 0.10
+    audio_integrity: 0.05
+    aesthetic: 0.60
 
   # CLIP 模型
   clip_model: "ViT-B-32"
