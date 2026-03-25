@@ -93,6 +93,30 @@ class BasicTools:
             ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
         )
 
+    def color_correct(
+        self, video_path: str,
+        brightness: float = 0.0, contrast: float = 1.0,
+        saturation: float = 1.0, gamma: float = 1.0,
+    ) -> str:
+        """技术性色彩校正（曝光校正、白平衡修正）"""
+        output = self._make_output_path(video_path, "cc")
+        vf = f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma}"
+        return self._run_ffmpeg(
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
+        )
+
+    def color_grade(
+        self, video_path: str,
+        brightness: float = 0.0, contrast: float = 1.0,
+        saturation: float = 1.0, gamma: float = 1.0,
+    ) -> str:
+        """创意调色（风格化色调、情绪渲染）"""
+        output = self._make_output_path(video_path, "cg")
+        vf = f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma}"
+        return self._run_ffmpeg(
+            ["-i", video_path, "-vf", vf] + SEARCH_ENCODE_ARGS, output,
+        )
+
     def white_balance(self, video_path: str, temperature: float = 6500) -> str:
         output = self._make_output_path(video_path, "wb")
         vf = f"colortemperature=temperature={temperature}"
@@ -194,22 +218,41 @@ class BasicTools:
     # ── 获取滤镜字符串（供合并模式使用）────────────────
 
     @staticmethod
-    def get_filter_string(tool_name: str, params: dict) -> str | None:
-        """返回工具对应的 FFmpeg 滤镜字符串，用于合并。不可合并的工具返回 None"""
+    def get_filter_string(
+        tool_name: str,
+        params: dict,
+        time_range: tuple[float, float] | None = None,
+    ) -> str | None:
+        """返回工具对应的 FFmpeg 滤镜字符串，用于合并。
+
+        当 time_range 不为 None 时，自动添加 enable='between(t,start,end)'，
+        使滤镜仅对指定时间段生效（段级编辑）。
+        """
+        eq_filter = lambda p: (
+            f"eq=brightness={p.get('brightness', 0)}:"
+            f"contrast={p.get('contrast', 1)}:"
+            f"saturation={p.get('saturation', 1)}:"
+            f"gamma={p.get('gamma', 1)}"
+        )
         mapping = {
-            "color_adjust": lambda p: (
-                f"eq=brightness={p.get('brightness', 0)}:"
-                f"contrast={p.get('contrast', 1)}:"
-                f"saturation={p.get('saturation', 1)}:"
-                f"gamma={p.get('gamma', 1)}"
-            ),
+            "color_adjust": eq_filter,          # 旧名向后兼容
+            "color_correct": eq_filter,         # 技术校正（阶段 3）
+            "color_grade": eq_filter,           # 创意调色（阶段 4）
             "white_balance": lambda p: f"colortemperature=temperature={p.get('temperature', 6500)}",
             "denoise": lambda p: f"hqdn3d=luma_spatial={p.get('strength', 4)}",
             "sharpen": lambda p: f"unsharp=5:5:{p.get('amount', 1)}:5:5:0",
         }
-        if tool_name in mapping:
-            return mapping[tool_name](params)
-        return None  # stabilize, speed_adjust, apply_lut 等不可合并
+        if tool_name not in mapping:
+            return None  # stabilize, speed_adjust, apply_lut 等不可合并
+
+        filter_str = mapping[tool_name](params)
+
+        # 段级编辑：添加时间范围 enable
+        if time_range is not None:
+            start, end = time_range
+            filter_str += f":enable='between(t,{start:.3f},{end:.3f})'"
+
+        return filter_str
 
     # ── 工具注册表 ────────────────────────────────────
 
@@ -217,33 +260,53 @@ class BasicTools:
         return {
             "color_adjust": {
                 "func": self.color_adjust,
-                "description": "调整亮度/对比度/饱和度/Gamma",
+                "description": "调整亮度/对比度/饱和度/Gamma（旧名，建议用 color_correct 或 color_grade）",
                 "params": ["brightness", "contrast", "saturation", "gamma"],
                 "mergeable": True,
+                "stage": "color_grade",
+            },
+            "color_correct": {
+                "func": self.color_correct,
+                "description": "技术性色彩校正（曝光、白平衡、灰度一致性）",
+                "params": ["brightness", "contrast", "saturation", "gamma"],
+                "mergeable": True,
+                "stage": "color_correct",
+            },
+            "color_grade": {
+                "func": self.color_grade,
+                "description": "创意调色（风格化色调、情绪渲染）",
+                "params": ["brightness", "contrast", "saturation", "gamma"],
+                "mergeable": True,
+                "stage": "color_grade",
             },
             "white_balance": {
                 "func": self.white_balance,
                 "description": "调整色温（白平衡）",
                 "params": ["temperature"],
                 "mergeable": True,
+                "stage": "color_correct",
             },
             "denoise": {
                 "func": self.denoise,
                 "description": "视频降噪",
                 "params": ["strength"],
                 "mergeable": True,
+                "stage": "denoise",
             },
             "sharpen": {
                 "func": self.sharpen,
                 "description": "锐化画面",
                 "params": ["amount"],
                 "mergeable": True,
+                "stage": "sharpen",
             },
             "stabilize": {
                 "func": self.stabilize,
-                "description": "视频防抖",
+                "description": "视频防抖（仅支持全局应用）",
                 "params": ["smoothing"],
                 "mergeable": False,
+                "global_only": True,
+                "stage": "stabilize",
             },
             "apply_lut": {
                 "func": self.apply_lut,

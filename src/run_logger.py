@@ -29,9 +29,10 @@ class RunLogger:
         self._write(
             f"**输入视频**: `{video_path}`\n\n"
             f"**配置**: model=`{config_summary.get('model', '?')}`, "
-            f"max_iter={config_summary.get('max_iterations', '?')}, "
-            f"mcts_sims={config_summary.get('mcts_simulations', '?')}, "
-            f"mcts_depth={config_summary.get('mcts_depth', '?')}\n\n"
+            f"outer={config_summary.get('max_outer', '?')}, "
+            f"inner={config_summary.get('max_inner', '?')}, "
+            f"mcts_sims={config_summary.get('mcts_sims', '?')}\n\n"
+            f"**架构**: Director-Editor-Critic 三Agent双层循环\n\n"
             f"---\n\n"
         )
 
@@ -117,6 +118,46 @@ class RunLogger:
         else:
             self._write(f"> **决策**: 回退 (分数 {best_score:.3f} ≤ {prev_score:.3f}, 无提升)\n\n")
         self._write("---\n\n")
+
+    def log_director(self, style_brief, is_revision: bool = False):
+        label = "Director 修订策略" if is_revision else "Director 风格策略"
+        self._write(f"## {label} [{self._elapsed()}]\n\n")
+        self._write(
+            f"- **风格**: {style_brief.overall_style}\n"
+            f"- **色彩方向**: {style_brief.color_direction}\n"
+            f"- **优先级**: {style_brief.priority}\n"
+            f"- **目标情绪**: {style_brief.target_mood}\n"
+            f"- **约束**: {', '.join(style_brief.constraints) if style_brief.constraints else '无'}\n"
+        )
+        if style_brief.stages:
+            self._write("\n**分阶段规划**:\n\n")
+            for sd in style_brief.stages:
+                targets = f" → {', '.join(sd.target_segments)}" if sd.target_segments else ""
+                self._write(f"| {sd.stage} | {sd.scope} | {sd.direction}{targets} |\n")
+            self._write("\n")
+        else:
+            self._write("- **分阶段规划**: 未输出（VLM 未返回 stages）\n\n")
+
+    def log_critic(self, outer_iter: int, inner_iter: int, feedback):
+        self._write(f"## 外层{outer_iter}-内层{inner_iter}: Critic 评审 [{self._elapsed()}]\n\n")
+        self._write(f"**综合分数**: {feedback.overall_score:.3f}\n\n")
+
+        if feedback.segment_feedback:
+            self._write("| 片段 | 判定 | 原因 |\n|------|------|------|\n")
+            for seg_id, sc in feedback.segment_feedback.items():
+                verdict = sc.verdict if hasattr(sc, "verdict") else sc.get("verdict", "?")
+                reason = sc.reason if hasattr(sc, "reason") else sc.get("reason", "")
+                self._write(f"| {seg_id} | {verdict} | {reason[:80]} |\n")
+            self._write("\n")
+
+        if feedback.global_issues:
+            self._write(f"**全局问题**: {', '.join(feedback.global_issues)}\n\n")
+        if feedback.suggestions:
+            self._write(f"**改进建议**: {', '.join(feedback.suggestions)}\n\n")
+
+    def log_route_decision(self, outer_iter: int, inner_iter: int, route: str, reason: str):
+        emoji = {"accept": "✓", "refine": "↻", "redirect": "↺"}.get(route, "?")
+        self._write(f"> **路由 {emoji}**: {route} — {reason}\n\n---\n\n")
 
     def log_finish(self, output_path: str, total_iterations: int, final_score: float):
         elapsed = time.time() - self._start_time

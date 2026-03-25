@@ -22,6 +22,7 @@ class FallbackLLM:
         self.client = OpenAI(
             api_key=config.get("api_key", None),
             base_url=config.get("base_url", None),
+            timeout=600.0,  # 72B 模型推理可能需要较长时间
         )
         # 模型优先级列表
         self.models = config.get("models", [config.get("model", "gpt-4o")])
@@ -70,6 +71,44 @@ class FallbackLLM:
         raise last_error  # 所有模型都失败
 
 
+def normalize_seg_id(target: str) -> str:
+    """归一化 segment ID 格式：'seg-0', 'seg_0', '0' → 'seg-0'"""
+    if isinstance(target, list):
+        target = target[0] if target else "global"
+    target = str(target).strip()
+    if target.startswith("seg-") or target.startswith("seg_"):
+        return "seg-" + target.split("seg")[-1].lstrip("-_")
+    if target.isdigit():
+        return f"seg-{target}"
+    return target
+
+
+# ── 专业后期阶段定义（Stage-Aware Planning）──────
+
+STAGE_ORDER = ["stabilize", "denoise", "color_correct", "color_grade", "sharpen"]
+
+TOOL_TO_STAGE = {
+    "stabilize": "stabilize",
+    "denoise": "denoise",
+    "color_correct": "color_correct",
+    "white_balance": "color_correct",
+    "color_grade": "color_grade",
+    "color_adjust": "color_grade",       # 旧工具名向后兼容
+    "auto_color_harmonize": "color_grade",
+    "apply_lut": "color_grade",
+    "sharpen": "sharpen",
+    "speed_adjust": None,
+}
+
+
+def get_stage(action) -> str | None:
+    """获取动作所属阶段（优先用显式设置，否则从工具名推导）"""
+    if hasattr(action, "stage") and action.stage:
+        return action.stage
+    tool_name = action.tool_name if hasattr(action, "tool_name") else ""
+    return TOOL_TO_STAGE.get(tool_name)
+
+
 def extract_json(text: str) -> dict | list | None:
     """从 LLM 输出中提取 JSON（兼容 markdown 代码块和前后多余文字）"""
     # 尝试提取 ```json ... ``` 代码块
@@ -115,8 +154,9 @@ class EditAction:
     action_description: str                  # 语义指令（如 "提升亮度使画面更通透"）
     target_segment: str = "global"           # "seg-0" / "seg-1" / "global"
     tool_type: str = "basic"                 # "basic" / "ai" / "compound"
-    tool_name: str = ""                      # "color_adjust" / "stabilize" / ...
+    tool_name: str = ""                      # "color_correct" / "color_grade" / ...
     parameters: dict = field(default_factory=dict)  # 工具参数
+    stage: str = ""                          # 所属阶段（可由 TOOL_TO_STAGE 自动推导）
 
 
 @dataclass
@@ -145,3 +185,46 @@ class EvaluationResult:
             + self.aesthetic * weights.get("aesthetic", 0.20)
         )
         return self.overall_score
+
+
+# ── 多 Agent 架构数据模型 ─────────────────────────
+
+@dataclass
+class StageDecision:
+    """单阶段决策（Stage-Aware Planning）"""
+    stage: str = ""                      # stabilize/denoise/color_correct/color_grade/sharpen
+    scope: str = "skip"                  # "skip" / "global" / "per_segment"
+    direction: str = ""                  # 方向描述，如 "轻度降噪，保留纹理细节"
+    target_segments: list[str] = field(default_factory=list)  # scope=per_segment 时指定段
+
+
+@dataclass
+class StyleBrief:
+    """Director 输出的风格策略（含分阶段规划）"""
+    overall_style: str = ""              # "清新自然" / "电影感" / "复古胶片"
+    color_direction: str = ""            # "保持原有暖色调" / "整体偏冷"
+    priority: str = ""                   # "优先修复暗段曝光" / "优先统一色彩"
+    constraints: list[str] = field(default_factory=list)  # "不要对高速运动段做 stabilize"
+    target_mood: str = ""                # "宁静治愈" / "活力动感"
+    stages: list[StageDecision] = field(default_factory=list)  # 分阶段规划
+
+
+@dataclass
+class SegmentCritic:
+    """Critic 对单段的评审"""
+    segment_id: str = ""
+    verdict: str = "unchanged"           # "improved" / "unchanged" / "degraded"
+    reason: str = ""                     # 因果分析
+    action_feedback: dict = field(default_factory=dict)  # 每个动作的具体反馈
+
+
+@dataclass
+class CriticFeedback:
+    """Critic 的完整评审输出"""
+    overall_score: float = 0.0
+    segment_feedback: dict = field(default_factory=dict)  # seg_id -> SegmentCritic
+    global_issues: list[str] = field(default_factory=list)
+    global_positives: list[str] = field(default_factory=list)
+    suggestions: list[str] = field(default_factory=list)
+    route: str = "accept"                # "accept" / "refine" / "redirect"
+    route_reason: str = ""

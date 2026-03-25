@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 TOOL_SELECTION_PROMPT = """你是视频编辑工具路由器。将语义编辑指令翻译为具体的工具调用参数。
 
 可用工具及参数范围：
-- color_adjust: brightness[-0.3,0.3], contrast[0.5,2.0], saturation[0.5,2.0], gamma[0.5,2.0]
-- white_balance: temperature[2000,10000] (色温K值)
+- color_correct: brightness[-0.3,0.3], contrast[0.5,2.0], saturation[0.5,2.0], gamma[0.5,2.0] (技术校正：曝光、白平衡修正)
+- color_grade: brightness[-0.3,0.3], contrast[0.5,2.0], saturation[0.5,2.0], gamma[0.5,2.0] (创意调色：风格化色调)
+- white_balance: temperature[2000,10000] (色温K值，属于校正阶段)
 - denoise: strength[1,10]
 - sharpen: amount[0.5,3.0]
 - stabilize: smoothing[5,30]

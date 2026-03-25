@@ -17,7 +17,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.models import EditAction, EditPlan, SegmentMetadata
+from src.models import (
+    EditAction, EditPlan, SegmentMetadata, StyleBrief, CriticFeedback,
+    normalize_seg_id, STAGE_ORDER, TOOL_TO_STAGE, get_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,22 +186,29 @@ class MCTSPlanner:
         self,
         candidates: list[EditAction],
         segments: list[SegmentMetadata],
+        style_brief: StyleBrief | None = None,
+        critic_feedback: CriticFeedback | None = None,
     ) -> list[EditPlan]:
         if not candidates:
             return []
 
         self._sim_cache.clear()
+        self._style_brief = style_brief
+        self._critic_feedback = critic_feedback
+
+        # 约束过滤：根据 Director 约束和 Critic 反馈缩小候选空间
+        filtered = self._filter_candidates(candidates, style_brief, critic_feedback)
 
         # 预加载每段中间帧的 CLIP 特征（一次性提取）
         self._preload_segment_features(segments)
 
         logger.info(
-            f"MCTS: 从 {len(candidates)} 条候选中搜索 "
+            f"MCTS: 从 {len(candidates)} 条候选过滤到 {len(filtered)} 条 "
             f"(depth={self.depth}, sims={self.simulations}, 本地评估)"
         )
 
         root = MCTSNode()
-        root.untried_actions = list(candidates)
+        root.untried_actions = list(filtered)
 
         for sim_i in range(self.simulations):
             node = self._select(root)
@@ -209,6 +219,91 @@ class MCTSPlanner:
 
         logger.info(f"MCTS 完成: 缓存条目={len(self._sim_cache)}")
         return self._extract_top_k(root)
+
+    def _filter_candidates(
+        self,
+        candidates: list[EditAction],
+        style_brief: StyleBrief | None,
+        critic_feedback: CriticFeedback | None,
+    ) -> list[EditAction]:
+        """根据 Director 约束和 Critic 反馈过滤候选"""
+        filtered = list(candidates)
+
+        # Stage-Aware 过滤：Director stages 中 scope=skip 的工具直接排除
+        if style_brief and style_brief.stages:
+            before = len(filtered)
+            skip_tools = set()
+            for sd in style_brief.stages:
+                if sd.scope == "skip":
+                    # 该阶段的所有工具都排除
+                    from src.models import TOOL_TO_STAGE
+                    for tool, stage in TOOL_TO_STAGE.items():
+                        if stage == sd.stage:
+                            skip_tools.add(tool)
+            if skip_tools:
+                filtered = [a for a in filtered if a.tool_name not in skip_tools]
+                if len(filtered) < before:
+                    logger.info(f"  Stage skip 过滤: {before} → {len(filtered)} 条 (跳过 {skip_tools})")
+
+        if style_brief and style_brief.constraints:
+            before = len(filtered)
+            for constraint in style_brief.constraints:
+                cl = constraint.lower()
+                if "stabilize" in cl or "防抖" in cl:
+                    filtered = [a for a in filtered if a.tool_name != "stabilize"]
+                if "sharpen" in cl or "锐化" in cl:
+                    filtered = [a for a in filtered if a.tool_name != "sharpen"]
+                if "过度" in cl or "避免" in cl:
+                    pass
+            if len(filtered) < before:
+                logger.info(f"  Director 约束过滤: {before} → {len(filtered)} 条候选")
+
+        if critic_feedback and critic_feedback.segment_feedback:
+            before = len(filtered)
+            # 段级约束：只排除特定段上失败的工具，不全局禁止
+            # key = (segment_id, tool_name)
+            degraded_seg_tools: set[tuple[str, str]] = set()
+
+            known_tools = {"stabilize", "sharpen", "denoise", "color_adjust",
+                           "color_correct", "color_grade",
+                           "white_balance", "speed_adjust", "auto_color_harmonize"}
+            tool_cn_map = {"稳定": "stabilize", "防抖": "stabilize",
+                           "锐化": "sharpen", "降噪": "denoise"}
+
+            for seg_id, sc in critic_feedback.segment_feedback.items():
+                norm_seg_id = normalize_seg_id(seg_id)
+                verdict = sc.verdict if hasattr(sc, "verdict") else ""
+                reason = sc.reason if hasattr(sc, "reason") else ""
+
+                if verdict == "degraded":
+                    # 从 action_feedback 提取
+                    if hasattr(sc, "action_feedback") and sc.action_feedback:
+                        for tool in sc.action_feedback.keys():
+                            degraded_seg_tools.add((norm_seg_id, tool))
+                    # 从 reason 文本提取工具名
+                    reason_lower = reason.lower()
+                    for tool in known_tools:
+                        if tool in reason_lower or tool.replace("_", "") in reason_lower:
+                            degraded_seg_tools.add((norm_seg_id, tool))
+                    for cn, tool in tool_cn_map.items():
+                        if cn in reason:
+                            degraded_seg_tools.add((norm_seg_id, tool))
+
+            if degraded_seg_tools:
+                def should_exclude(action):
+                    target = normalize_seg_id(action.target_segment)
+                    return (target, action.tool_name) in degraded_seg_tools
+
+                filtered = [a for a in filtered if not should_exclude(a)]
+                excluded = [(s, t) for s, t in degraded_seg_tools]
+                if len(filtered) < before:
+                    logger.info(f"  Critic 段级过滤: {before} → {len(filtered)} 条 (排除 {excluded})")
+
+        # 至少保留 3 个候选
+        if len(filtered) < 3 and len(candidates) >= 3:
+            filtered = candidates[:max(3, len(filtered))]
+
+        return filtered
 
     def _preload_segment_features(self, segments: list[SegmentMetadata]):
         """预加载每段中间帧的 CLIP 特征"""
@@ -284,10 +379,13 @@ class MCTSPlanner:
             tool = action.tool_name
             tool_count[tool] = tool_count.get(tool, 0) + 1
             target = action.target_segment
-            params = action.parameters
+            # VLM 有时返回 list 而非 string，统一处理
+            if isinstance(target, list):
+                target = target[0] if target else "global"
+            params = action.parameters if isinstance(action.parameters, dict) else {}
 
             # ── 参数合理性检查 ──
-            if tool == "color_adjust":
+            if tool in ("color_adjust", "color_correct", "color_grade"):
                 br = abs(params.get("brightness", 0))
                 ct = abs(params.get("contrast", 1) - 1)
                 sat = abs(params.get("saturation", 1) - 1)
@@ -320,13 +418,14 @@ class MCTSPlanner:
                     penalty += 0.10  # 过度降噪丢细节
 
             elif tool == "stabilize":
-                # 检查目标段是否真的抖
+                # stabilize 是画质风险最高的工具，保守评分
+                # 只有极度不稳定（光流方差 > 200）才给小幅加分
                 if target in seg_map:
                     seg = seg_map[target]
-                    if seg.stability_score > 50:
-                        bonus += 0.10  # 确实需要防抖
+                    if seg.stability_score > 200:
+                        bonus += 0.03  # 极度抖动才有微小加分
                     else:
-                        penalty += 0.05  # 不需要防抖还防抖
+                        penalty += 0.10  # 不够抖就不该用 stabilize
 
             elif tool == "auto_color_harmonize":
                 bonus += 0.05
@@ -343,6 +442,34 @@ class MCTSPlanner:
         for tool, count in tool_count.items():
             if count > 2:
                 penalty += 0.10 * (count - 2)  # 同一工具用太多次
+
+        # ── 阶段顺序检查 ──
+        stage_indices = []
+        for action in actions:
+            stage = get_stage(action)
+            if stage and stage in STAGE_ORDER:
+                stage_indices.append(STAGE_ORDER.index(stage))
+        for i in range(len(stage_indices) - 1):
+            if stage_indices[i] > stage_indices[i + 1]:
+                penalty += 0.10  # 每个逆序扣分
+
+        # ── StyleBrief 一致性检查（Reflection-Guided） ──
+        if self._style_brief:
+            brief = self._style_brief
+            for action in actions:
+                desc = action.action_description.lower()
+                # 如果 priority 匹配，加分
+                if brief.priority and brief.priority.lower()[:4] in desc:
+                    bonus += 0.05
+
+            # 如果有 Critic 建议匹配的动作，加分（先验引导）
+            if self._critic_feedback and self._critic_feedback.suggestions:
+                for suggestion in self._critic_feedback.suggestions:
+                    sl = suggestion.lower()
+                    for action in actions:
+                        if action.tool_name in sl or action.target_segment in sl:
+                            bonus += 0.08
+                            break
 
         # 合并
         score = base_score + bonus - penalty

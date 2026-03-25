@@ -1,12 +1,11 @@
 # VlogAgent 默认配置
 
-# LLM API 配置（阿里云百炼，按优先级自动降级）
+# LLM API 配置（vLLM 自部署 Qwen2.5-VL-72B）
 openai:
-  api_key: "sk-85491afc6fd747568bd593357f15c5eb"           # 填入阿里云百炼 API Key，或设置环境变量 OPENAI_API_KEY
-  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  # 模型优先级列表：第一个配额用尽后自动切换到下一个
+  api_key: "not-needed"                                     # vLLM 不校验 API Key，填任意值
+  base_url: "http://localhost:8000/v1"                     # 通过 SSH 隧道连接云服务器
   models:
-    - "qwen3-vl-plus-2025-09-23"
+    - "qwen2.5-vl"                                          # 对应 --served-model-name
 
 # Perceiver 配置
 perceiver:
@@ -25,12 +24,10 @@ perceiver:
   # Whisper ASR
   whisper_model: "base"          # tiny / base / small / medium / large
 
-# Planner (MCTS) 配置
+# Planner 配置（逐阶段视觉预筛选）
 planner:
-  mcts_depth: 3                  # 搜索深度
-  mcts_simulations: 50           # 模拟次数（本地评估，无 API 成本）
-  ucb_c: 1.4                     # UCB 探索系数
-  top_k: 3                       # 返回 Top-K 方案
+  max_stage_refine: 2            # 每阶段最多重试次数
+  max_candidates_per_stage: 3    # 每阶段生成的候选数
 
 # Executor 配置
 executor:
@@ -63,6 +60,13 @@ evaluator:
   min_improvement: 0.01          # 最小提升阈值
   max_no_improve_rounds: 2       # 连续无提升轮数上限
 
-# Agent 主循环
+# Agent 主循环（双层循环）
 agent:
-  max_iterations: 3              # 最大闭环迭代次数
+  max_outer_iterations: 3        # 外层循环最大轮数（Director 驱动）
+  max_inner_iterations: 3        # 内层循环最大轮数（Editor-Critic 打磨）
+
+# Critic 配置
+critic:
+  accept_threshold: 0.01         # accept 需要的最小提升
+  redirect_after_refines: 2      # 连续 refine 几轮后 redirect
+  good_enough_score: 0.85        # 分数达标直接终止

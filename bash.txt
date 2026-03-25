@@ -1,0 +1,11 @@
+ssh -i ~/Downloads/KeyPair-169f.pem root@1.95.152.113
+docker exec -it qwen-api-server bash
+
+启动隧道：
+ssh -i ~/Downloads/KeyPair-169f.pem -L 8000:localhost:8000 root@1.95.152.113
+
+启动服务：
+python3 /data/code/serve_qwen_vl.py --model-path /data/models/Qwen2.5-VL-72B-Instruct --port 8000
+
+停止服务：
+fuser -k 8000/tcp; sleep 2
