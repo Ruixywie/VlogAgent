@@ -155,8 +155,17 @@ class RunLogger:
         if feedback.suggestions:
             self._write(f"**改进建议**: {', '.join(feedback.suggestions)}\n\n")
 
+    def log_stage_editor(self, stage_name: str, candidates: list, best_action, best_score: float):
+        """记录逐阶段 Editor 的候选生成和预筛选"""
+        self._write(f"### 阶段 {stage_name}: Editor [{self._elapsed()}]\n\n")
+        self._write(f"**候选** ({len(candidates)} 条):\n\n")
+        for i, a in enumerate(candidates):
+            self._write(f"  {i+1}. `[{a.tool_name}]` {a.action_description} → {a.target_segment} | params={a.parameters}\n")
+        if best_action:
+            self._write(f"\n**预筛选最优**: `[{best_action.tool_name}]` score={best_score:.3f}\n\n")
+
     def log_route_decision(self, outer_iter: int, inner_iter: int, route: str, reason: str):
-        emoji = {"accept": "✓", "refine": "↻", "redirect": "↺"}.get(route, "?")
+        emoji = {"accept": "✓", "refine": "↻", "redirect": "↺", "skip": "⊘"}.get(route, "?")
         self._write(f"> **路由 {emoji}**: {route} — {reason}\n\n---\n\n")
 
     def log_finish(self, output_path: str, total_iterations: int, final_score: float):

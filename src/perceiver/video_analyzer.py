@@ -20,6 +20,7 @@ class VideoAnalyzer:
         self.keyframe_interval = config.get("keyframe_interval", 1.0)  # 每N秒提取1帧
         self.max_keyframes_per_segment = config.get("max_keyframes_per_segment", 10)
         self.whisper_model_name = config.get("whisper_model", "base")
+        self.skip_whisper = config.get("skip_whisper", False)  # 跳过 ASR 加速分析
         self.ffmpeg_path = config.get("ffmpeg_path", "ffmpeg")
         self._whisper_model = None
 
@@ -153,6 +154,13 @@ class VideoAnalyzer:
 
     def analyze_audio(self, video_path: str, start: float, end: float) -> dict:
         """Whisper ASR 转录 + 语音检测"""
+        # 配置跳过或短片段（< 2 秒）跳过 ASR
+        if self.skip_whisper:
+            return {"has_speech": False, "speech_text": ""}
+        duration = end - start
+        if duration < 2.0:
+            return {"has_speech": False, "speech_text": ""}
+
         import whisper
         import tempfile
 

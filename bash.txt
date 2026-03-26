@@ -7,5 +7,13 @@ ssh -i ~/Downloads/KeyPair-169f.pem -L 8000:localhost:8000 root@1.95.152.113
 启动服务：
 python3 /data/code/serve_qwen_vl.py --model-path /data/models/Qwen2.5-VL-72B-Instruct --port 8000
 
+python3 -m vllm.entrypoints.openai.api_server \
+--model /data/models/Qwen2.5-VL-72B-Instruct \
+--served-model-name qwen2.5-vl \
+--tensor-parallel-size 8 \
+--trust-remote-code \
+--port 8000 \
+--host 0.0.0.0
+
 停止服务：
 fuser -k 8000/tcp; sleep 2

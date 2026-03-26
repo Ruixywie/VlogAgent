@@ -94,8 +94,26 @@ class VlogAgent:
         current_video = video_path
         actions_log = []
 
+        # VLM 常见参数名纠正映射
+        PARAM_NAME_FIX = {
+            "smoothing_value": "smoothing",
+            "smoothing_level": "smoothing",
+            "blur_strength": "strength",
+            "denoise_strength": "strength",
+            "sharpen_amount": "amount",
+            "temperature_value": "temperature",
+            "brightness_value": "brightness",
+        }
+
         for action in plan.actions:
             action = self.tool_selector.resolve_action(action)
+            # 修正 VLM 返回的错误参数名
+            if isinstance(action.parameters, dict):
+                fixed_params = {}
+                for k, v in action.parameters.items():
+                    fixed_params[PARAM_NAME_FIX.get(k, k)] = v
+                action.parameters = fixed_params
+
             log_entry = {
                 "tool_name": action.tool_name,
                 "description": action.action_description,
@@ -281,8 +299,9 @@ class VlogAgent:
         total_outer = 0
         no_outer_improve = 0
 
-        # 跨轮次保留 Critic 反馈（不在外层循环中重置）
+        # 跨轮次保留 Critic 反馈和观察描述
         last_critic_feedback = None
+        cached_observation = None  # 外层第 2+ 轮复用观察，节省 VLM 调用
 
         # ═══════════ 外层循环（Director 驱动）═══════════
         for outer_iter in range(1, self.max_outer + 1):
@@ -298,11 +317,15 @@ class VlogAgent:
             max_stage_refine = self.config.get("planner", {}).get("max_stage_refine", 2)
 
             if style_brief.stages:
-                # 一次性观察画面（所有阶段共用）
-                run_log.step_start("observe")
-                logger.info("  [Editor] 观察画面...")
-                observation = self.editor.observe(segments)
-                logger.info(f"  观察完成 ({run_log.step_end('observe'):.1f}s)")
+                # 观察画面（外层第 1 轮执行，后续轮复用）
+                if cached_observation is None:
+                    run_log.step_start("observe")
+                    logger.info("  [Editor] 观察画面...")
+                    cached_observation = self.editor.observe(segments)
+                    logger.info(f"  观察完成 ({run_log.step_end('observe'):.1f}s)")
+                else:
+                    logger.info("  [Editor] 复用上轮观察描述（跳过 VLM 调用）")
+                observation = cached_observation
 
                 stage_accepted_actions = []
 
@@ -311,15 +334,26 @@ class VlogAgent:
                         logger.info(f"  阶段 {stage_decision.stage}: skip")
                         continue
 
+                    # stabilize 仅支持 global 模式，per_segment 强制转为 global
+                    if stage_decision.stage == "stabilize" and stage_decision.scope == "per_segment":
+                        logger.info(
+                            f"  阶段 stabilize: per_segment → 强制转为 global"
+                            f"（stabilize 仅支持全局应用）"
+                        )
+                        stage_decision.scope = "global"
+                        stage_decision.target_segments = []
+
                     logger.info(f"  ── 阶段 {stage_decision.stage} ({stage_decision.scope}) ──")
                     stage_refine_count = 0
+                    # 每阶段独立的 Critic 反馈（不跨阶段传递）
+                    stage_critic_feedback = None
 
                     for stage_attempt in range(max_stage_refine + 1):
                         # ① Editor 为该阶段生成 2-3 条候选
                         run_log.step_start("editor_stage")
                         candidates = self.editor.suggest_for_stage(
                             observation, segments, stage_decision,
-                            style_brief, critic_feedback,
+                            style_brief, stage_critic_feedback,  # 用阶段内反馈
                         )
                         if not candidates:
                             logger.warning(f"  阶段 {stage_decision.stage}: 无候选，跳过")
@@ -337,6 +371,21 @@ class VlogAgent:
                             f"  [{best_action.tool_name}] 预筛选分={best_score:.3f} "
                             f"({run_log.step_end('editor_stage'):.1f}s)"
                         )
+                        run_log.log_stage_editor(
+                            stage_decision.stage, candidates, best_action, best_score
+                        )
+
+                        # 检查工具名是否有效（防止中文工具名导致无操作）
+                        registry = self.basic_tools.get_tool_registry()
+                        compound_registry = self.compound_tools.get_tool_registry()
+                        if (best_action.tool_name not in registry and
+                                best_action.tool_name not in compound_registry):
+                            logger.warning(
+                                f"  阶段 {stage_decision.stage}: 工具名 '{best_action.tool_name}' "
+                                f"无效，跳过此候选"
+                            )
+                            stage_refine_count += 1
+                            continue
 
                         # ③ FFmpeg 执行最优候选
                         run_log.step_start("executor_stage")
@@ -348,33 +397,48 @@ class VlogAgent:
                             run_log.log_executor(outer_iter, stage_attempt + 1, actions_log)
                         except Exception as e:
                             logger.error(f"  阶段 {stage_decision.stage} 执行失败: {e}")
-                            break
+                            stage_refine_count += 1
+                            continue
+                        # 检查是否真正执行成功（防止参数名错误等导致的静默失败）
+                        any_success = any(log.get("success", False) for log in actions_log)
+                        if not any_success:
+                            logger.warning(
+                                f"  阶段 {stage_decision.stage}: 执行未成功 "
+                                f"({actions_log[0].get('error', '未知错误') if actions_log else '无日志'})"
+                            )
+                            stage_refine_count += 1
+                            continue
                         logger.info(f"  执行完成 ({run_log.step_end('executor_stage'):.1f}s)")
 
                         # ④ Critic 评审该阶段
+                        # 对比基准是当前阶段的输入（而非原始视频），
+                        # 避免前序阶段的变化被归咎于当前阶段
                         run_log.step_start("critic_stage")
-                        critic_feedback = self.critic.evaluate_stage(
-                            original_path, edited_path, segments,
+                        stage_critic_feedback = self.critic.evaluate_stage(
+                            current_video, edited_path, segments,
                             stage_decision.stage, best_action,
                             prev_score, stage_refine_count,
                         )
-                        run_log.log_critic(outer_iter, stage_attempt + 1, critic_feedback)
+                        run_log.log_critic(outer_iter, stage_attempt + 1, stage_critic_feedback)
                         run_log.log_route_decision(
                             outer_iter, stage_attempt + 1,
-                            critic_feedback.route, critic_feedback.route_reason,
+                            stage_critic_feedback.route, stage_critic_feedback.route_reason,
                         )
                         logger.info(
-                            f"  Critic: {critic_feedback.route} "
-                            f"({critic_feedback.route_reason}) "
+                            f"  Critic: {stage_critic_feedback.route} "
+                            f"({stage_critic_feedback.route_reason}) "
                             f"({run_log.step_end('critic_stage'):.1f}s)"
                         )
 
-                        if critic_feedback.route == "accept":
+                        if stage_critic_feedback.route == "accept":
                             current_video = edited_path
-                            prev_score = critic_feedback.overall_score
+                            prev_score = stage_critic_feedback.overall_score
                             resolved = self.tool_selector.resolve_action(best_action)
                             stage_accepted_actions.append(resolved)
                             logger.info(f"  阶段 {stage_decision.stage}: Accept!")
+                            break
+                        elif stage_critic_feedback.route == "skip":
+                            logger.info(f"  阶段 {stage_decision.stage}: Skip（重试无效，跳过）")
                             break
                         else:
                             stage_refine_count += 1
@@ -385,7 +449,7 @@ class VlogAgent:
                     action_chain.extend(stage_accepted_actions)
                     inner_accepted = True
                     no_outer_improve = 0
-                    last_critic_feedback = critic_feedback
+                    last_critic_feedback = stage_critic_feedback
                     logger.info(f"  逐阶段完成! 动作链: {len(action_chain)} 个动作")
                 else:
                     logger.info("  所有阶段均跳过或失败")

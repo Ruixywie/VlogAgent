@@ -31,6 +31,7 @@ class StageSelector:
         # 关键帧缓存（整个 run 过程只加载一次）
         self._keyframe_cache: dict[int, np.ndarray] = {}  # seg_id → BGR frame
         self._feature_cache: dict[int, object] = {}       # seg_id → CLIP feature
+        self._baseline_cache: dict[int, float] = {}       # seg_id → score(orig, orig)
 
     def preload_keyframes(self, segments: list[SegmentMetadata]):
         """预加载每段中间帧的 BGR 像素和 CLIP 特征（一次性）"""
@@ -47,7 +48,10 @@ class StageSelector:
                 frame = cv2.imread(kf_path)
                 if frame is not None:
                     self._keyframe_cache[seg.seg_id] = frame
-                    self._feature_cache[seg.seg_id] = self.scorer.extract_frame_feature(frame)
+                    feat = self.scorer.extract_frame_feature(frame)
+                    self._feature_cache[seg.seg_id] = feat
+                    # 预计算 baseline score（orig vs orig），用于差值模式
+                    self._baseline_cache[seg.seg_id] = self.scorer.score_edit(feat, feat)
 
         logger.info(f"StageSelector: 预加载 {len(self._keyframe_cache)} 段关键帧")
 
@@ -124,9 +128,19 @@ class StageSelector:
                 scores.append(0.5)
                 continue
 
-            # CLIP+MLP 打分
+            # CLIP+MLP 打分（差值模式）
+            # MLP 是用 pairwise ranking loss 训练的，Sigmoid 输出的绝对值
+            # 会饱和在 ~0.99 附近，导致所有候选分数相同。
+            # 改为：score(orig, edited) - score(orig, orig) 作为"编辑增益"，
+            # 再映射到 [0, 1] 范围。
             sim_feat = self.scorer.extract_frame_feature(simulated)
-            score = self.scorer.score_edit(orig_feat, sim_feat)
+            raw_score = self.scorer.score_edit(orig_feat, sim_feat)
+            baseline_score = self._baseline_cache.get(seg_id, 0.5)
+            # 差值表示编辑相对于"无编辑"的增益
+            delta = raw_score - baseline_score
+            # 映射到 [0, 1]：delta=0 → 0.5, delta=+0.1 → 高分, delta=-0.1 → 低分
+            score = 0.5 + delta * 5.0  # 放大差异，增加区分度
+            score = max(0.0, min(1.0, score))
             scores.append(score)
 
         return float(np.mean(scores)) if scores else 0.5

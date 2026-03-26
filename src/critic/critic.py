@@ -269,6 +269,30 @@ class Critic:
 
     # ── 逐阶段轻量评审 ─────────────────────────────
 
+    STAGE_CRITIC_PROMPT = """你是专业视频编辑质量评审。请评审当前阶段的编辑效果。
+
+## 评审要求
+对每个片段判断 verdict: "improved"/"unchanged"/"degraded" + reason。
+
+## 路由决策（你来决定）
+- "accept": 编辑整体有效，这个阶段的操作可以保留
+- "refine": 有问题需要调整（某些段变差了，或效果不明显），给出具体建议
+- "skip": 这个操作对画面没有帮助甚至有害，应该跳过整个阶段
+
+## 注意
+- 如果有任何段 degraded，应该倾向 refine 或 skip，不应该 accept
+- 如果所有段都 unchanged，说明操作没效果，应该 skip
+- 只有大多数段 improved 且没有 degraded 才 accept
+
+只返回 JSON：
+{
+  "overall_score": 0.0-1.0,
+  "segment_feedback": {"seg-0": {"verdict": "...", "reason": "..."}},
+  "suggestions": ["..."],
+  "route": "accept 或 refine 或 skip",
+  "route_reason": "决策理由"
+}"""
+
     def evaluate_stage(
         self,
         original_path: str,
@@ -279,22 +303,54 @@ class Critic:
         prev_score: float,
         refine_count: int,
     ) -> CriticFeedback:
-        """评审单个阶段的编辑效果（轻量版）"""
+        """评审单个阶段的编辑效果——VLM 自主决定路由"""
         logger.info(f"Critic: 评审阶段 {stage_name}...")
 
         scenes = [s.time_range for s in segments]
 
-        # 技术指标（只算视觉质量和保真度）
+        # 技术指标
         visual = self._evaluator.score_visual_quality(edited_path)
         fidelity = self._evaluator.score_content_fidelity(original_path, edited_path)
 
-        # VLM 逐段对比（复用现有方法）
-        plan = EditPlan(actions=[action])
-        vlm_result = self._vlm_structured_review(original_path, edited_path, segments, plan)
+        # VLM 评审（带路由决策）
+        orig_frames = self._extract_segment_frames(original_path, scenes)
+        edit_frames = self._extract_segment_frames(edited_path, scenes)
+
+        vlm_result = {"overall_score": 0.5, "segment_feedback": {},
+                      "suggestions": [], "route": "refine", "route_reason": ""}
+
+        if orig_frames and edit_frames:
+            comparison = build_comparison_storyboard(orig_frames, edit_frames)
+            content = []
+            content.append({"type": "text", "text": (
+                f"## 当前阶段: {stage_name}\n"
+                f"## 执行的操作: [{action.tool_name}] {action.action_description} → {action.target_segment}\n"
+            )})
+            if comparison:
+                desc, b64 = comparison[0]
+                content.append({"type": "text", "text": "## 编辑前后对比（左:原始 右:编辑后）"})
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"},
+                })
+            content.append({"type": "text", "text": "\n请评审并做出路由决策。"})
+
+            try:
+                response = self.llm.chat(
+                    messages=[
+                        {"role": "system", "content": self.STAGE_CRITIC_PROMPT},
+                        {"role": "user", "content": content},
+                    ],
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+                data = extract_json(response.choices[0].message.content)
+                if data and isinstance(data, dict):
+                    vlm_result = data
+            except Exception as e:
+                logger.warning(f"Critic VLM 评审失败: {e}")
 
         aesthetic = vlm_result.get("overall_score", 0.5)
-
-        # 简化的综合分（阶段级不算一致性和音频）
         overall_score = visual * 0.15 + fidelity * 0.20 + aesthetic * 0.65
 
         # 构建反馈
@@ -307,14 +363,16 @@ class Critic:
                     reason=fb.get("reason", ""),
                 )
 
-        # 路由：阶段级只有 accept/refine
-        improvement = overall_score - prev_score
-        if improvement > self.accept_threshold:
-            route, route_reason = "accept", f"阶段 {stage_name} 提升 +{improvement:.3f}"
-        elif refine_count >= 2:
-            route, route_reason = "accept", f"阶段 {stage_name} 重试 {refine_count} 次后接受"
-        else:
-            route, route_reason = "refine", f"阶段 {stage_name} 未达标 (improvement={improvement:.3f})"
+        # 路由：优先用 VLM 决策，兜底用规则
+        route = vlm_result.get("route", "")
+        route_reason = vlm_result.get("route_reason", "")
+
+        if route not in ("accept", "refine", "skip"):
+            # VLM 没给有效路由，用规则兜底
+            if refine_count >= 2:
+                route, route_reason = "skip", f"阶段 {stage_name} 重试 {refine_count} 次，跳过"
+            else:
+                route, route_reason = "refine", "VLM 未给出有效路由"
 
         feedback = CriticFeedback(
             overall_score=overall_score,

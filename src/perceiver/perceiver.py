@@ -282,7 +282,9 @@ class Perceiver:
             f"2. 生成 2-3 条候选编辑指令，参数各不相同（用于对比选择最优）\n"
             f"3. 参数要合理保守，避免过度处理\n"
             f"4. 以 JSON 格式返回：{{\"actions\": [...]}}\n"
-            f"5. 每条包含：action_description, target_segment, tool_type, tool_name, parameters, stage"
+            f"5. 每条包含：action_description, target_segment, tool_type, tool_name, parameters, stage\n"
+            f"6. **tool_name 必须使用精确的英文函数名**（如 denoise, sharpen, color_correct, color_grade, white_balance, stabilize, auto_color_harmonize）\n"
+            f"   **绝对不要**使用中文名（如'视频降噪'）或自造名称（如'video_denose'）"
         )
 
         user_parts = [
@@ -305,7 +307,7 @@ class Perceiver:
                 {"role": "user", "content": "\n".join(user_parts)},
             ],
             temperature=0.7,
-            max_tokens=400,
+            max_tokens=600,  # 3 条候选的完整 JSON 需要足够空间
         )
 
         raw = response.choices[0].message.content
@@ -316,6 +318,27 @@ class Perceiver:
 
         action_list = data if isinstance(data, list) else data.get("actions", [])
 
+        # VLM 工具名纠正映射（中文、拼写错误、描述性名称 → 精确函数名）
+        TOOL_NAME_MAP = {
+            # 中文名
+            "视频降噪": "denoise", "降噪": "denoise", "去噪": "denoise",
+            "锐化": "sharpen", "视频锐化": "sharpen",
+            "视频防抖": "stabilize", "防抖": "stabilize", "稳定": "stabilize", "稳定化": "stabilize",
+            "技术校正": "color_correct", "色彩校正": "color_correct", "颜色校正": "color_correct",
+            "创意调色": "color_grade", "调色": "color_grade", "色彩调色": "color_grade",
+            "白平衡": "white_balance", "色温调整": "white_balance", "色温": "white_balance",
+            "色彩统一": "auto_color_harmonize", "统一全片色彩风格": "auto_color_harmonize",
+            "统一色彩": "auto_color_harmonize", "色彩和谐": "auto_color_harmonize",
+            # 拼写错误 / 变体
+            "video_denose": "denoise", "video_denoise": "denoise",
+            "denosie": "denoise", "de_noise": "denoise",
+            "smoothing": "stabilize", "video_stabilize": "stabilize",
+            "color_adjustment": "color_grade", "color_grading": "color_grade",
+            "color_correction": "color_correct",
+            "sharpening": "sharpen", "unsharp": "sharpen",
+            "white_bal": "white_balance", "wb": "white_balance",
+        }
+
         actions = []
         for item in action_list:
             target = item.get("target_segment", "global")
@@ -325,13 +348,23 @@ class Perceiver:
             if not isinstance(params, dict):
                 params = {}
             tool_name = str(item.get("tool_name", ""))
+            # 如果工具名不在已知列表中，尝试中文映射
+            known = {"stabilize", "denoise", "color_correct", "color_grade",
+                     "white_balance", "sharpen", "auto_color_harmonize",
+                     "color_adjust", "speed_adjust", "apply_lut"}
+            if tool_name not in known:
+                mapped = TOOL_NAME_MAP.get(tool_name, "")
+                if mapped:
+                    logger.info(f"  工具名映射: '{tool_name}' → '{mapped}'")
+                    tool_name = mapped
+
             action = EditAction(
                 action_description=str(item.get("action_description", "")),
                 target_segment=str(target),
                 tool_type=str(item.get("tool_type", "basic")),
                 tool_name=tool_name,
                 parameters=params,
-                stage=stage,  # 强制设为当前阶段
+                stage=stage,
             )
             actions.append(action)
 

@@ -23,6 +23,7 @@ perceiver:
 
   # Whisper ASR
   whisper_model: "base"          # tiny / base / small / medium / large
+  skip_whisper: true             # 跳过 ASR 加速（无语音视频建议开启）
 
 # Planner 配置（逐阶段视觉预筛选）
 planner:
@@ -62,8 +63,8 @@ evaluator:
 
 # Agent 主循环（双层循环）
 agent:
-  max_outer_iterations: 3        # 外层循环最大轮数（Director 驱动）
-  max_inner_iterations: 3        # 内层循环最大轮数（Editor-Critic 打磨）
+  max_outer_iterations: 2        # 外层循环最大轮数
+  max_inner_iterations: 3        # 内层循环最大轮数（已改为逐阶段循环）
 
 # Critic 配置
 critic:

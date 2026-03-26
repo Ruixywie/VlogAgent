@@ -3,4 +3,6 @@
 2602.22809v2.pdf
 venv/
 CLAUDE.md
-training/data/
+training/
+output/
+data/
